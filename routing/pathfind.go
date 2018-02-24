@@ -8,7 +8,6 @@ import (
 
 	"container/heap"
 
-	"github.com/boltdb/bolt"
 	"github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -374,28 +373,11 @@ func newRoute(amtToSend lnwire.MilliSatoshi, sourceVertex Vertex,
 	return route, nil
 }
 
-// Vertex is a simple alias for the serialization of a compressed Bitcoin
-// public key.
-type Vertex [33]byte
-
-// NewVertex returns a new Vertex given a public key.
-func NewVertex(pub *btcec.PublicKey) Vertex {
-	var v Vertex
-	copy(v[:], pub.SerializeCompressed())
-	return v
-}
-
-// String returns a human readable version of the Vertex which is the
-// hex-encoding of the serialized compressed public key.
-func (v Vertex) String() string {
-	return fmt.Sprintf("%x", v[:])
-}
-
 // edgeWithPrev is a helper struct used in path finding that couples an
 // directional edge with the node's ID in the opposite direction.
 type edgeWithPrev struct {
 	edge     *ChannelHop
-	prevNode [33]byte
+	prevNode Vertex
 }
 
 // edgeWeight computes the weight of an edge. This value is used when searching
@@ -432,19 +414,10 @@ func edgeWeight(amt lnwire.MilliSatoshi, e *channeldb.ChannelEdgePolicy) int64 {
 // time-lock+fee costs along a particular edge. If a path is found, this
 // function returns a slice of ChannelHop structs which encoded the chosen path
 // from the target to the source.
-func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
-	sourceNode *channeldb.LightningNode, target *btcec.PublicKey,
+func findPath(graph graphSource,
+	sourceVertex Vertex, target Vertex,
 	ignoredNodes map[Vertex]struct{}, ignoredEdges map[uint64]struct{},
 	amt lnwire.MilliSatoshi) ([]*ChannelHop, error) {
-
-	var err error
-	if tx == nil {
-		tx, err = graph.Database().Begin(false)
-		if err != nil {
-			return nil, err
-		}
-		defer tx.Rollback()
-	}
 
 	// First we'll initialize an empty heap which'll help us to quickly
 	// locate the next edge we should visit next during our graph
@@ -455,10 +428,10 @@ func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 	// map for the node set with a distance of "infinity".  We also mark
 	// add the node to our set of unvisited nodes.
 	distance := make(map[Vertex]nodeWithDist)
-	if err := graph.ForEachNode(tx, func(_ *bolt.Tx, node *channeldb.LightningNode) error {
+	if err := graph.ForEachNode(func(node Vertex) error {
 		// TODO(roasbeef): with larger graph can just use disk seeks
 		// with a visited map
-		distance[Vertex(node.PubKeyBytes)] = nodeWithDist{
+		distance[node] = nodeWithDist{
 			dist: infinity,
 			node: node,
 		}
@@ -473,17 +446,14 @@ func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 	// To start, we add the source of our path finding attempt to the
 	// distance map with with a distance of 0. This indicates our starting
 	// point in the graph traversal.
-	sourceVertex := Vertex(sourceNode.PubKeyBytes)
 	distance[sourceVertex] = nodeWithDist{
 		dist: 0,
-		node: sourceNode,
+		node: sourceVertex,
 	}
 
 	// To start, our source node will the sole item within our distance
 	// heap.
 	heap.Push(&nodeHeap, distance[sourceVertex])
-
-	targetBytes := target.SerializeCompressed()
 
 	// We'll use this map as a series of "previous" hop pointers. So to get
 	// to `Vertex` we'll take the edge that it's mapped to within `prev`.
@@ -497,24 +467,22 @@ func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 		// If we've reached our target (or we don't have any outgoing
 		// edges), then we're done here and can exit the graph
 		// traversal early.
-		if bytes.Equal(bestNode.PubKeyBytes[:], targetBytes) {
+		if bytes.Equal(bestNode[:], target[:]) {
 			break
 		}
 
 		// Now that we've found the next potential step to take we'll
 		// examine all the outgoing edge (channels) from this node to
 		// further our graph traversal.
-		pivot := Vertex(bestNode.PubKeyBytes)
-		err := bestNode.ForEachChannel(tx, func(tx *bolt.Tx,
-			edgeInfo *channeldb.ChannelEdgeInfo,
-			outEdge, inEdge *channeldb.ChannelEdgePolicy) error {
+		pivot := bestNode
+		err := graph.ForEachChannel(bestNode, func(e *Edge) error {
 
-			v := Vertex(outEdge.Node.PubKeyBytes)
+			v := Vertex(e.outEdge.Node.PubKeyBytes)
 
 			// If the outgoing edge is currently disabled, then
 			// we'll stop here, as we shouldn't attempt to route
 			// through it.
-			edgeFlags := lnwire.ChanUpdateFlag(outEdge.Flags)
+			edgeFlags := lnwire.ChanUpdateFlag(e.outEdge.Flags)
 			if edgeFlags&lnwire.ChanUpdateDisabled == lnwire.ChanUpdateDisabled {
 				return nil
 			}
@@ -525,14 +493,14 @@ func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 			if _, ok := ignoredNodes[v]; ok {
 				return nil
 			}
-			if _, ok := ignoredEdges[outEdge.ChannelID]; ok {
+			if _, ok := ignoredEdges[e.outEdge.ChannelID]; ok {
 				return nil
 			}
 
 			// Compute the tentative distance to this new
 			// channel/edge which is the distance to our current
 			// pivot node plus the weight of this edge.
-			tempDist := distance[pivot].dist + edgeWeight(amt, outEdge)
+			tempDist := distance[pivot].dist + edgeWeight(amt, e.outEdge)
 
 			// If this new tentative distance is better than the
 			// current best known distance to this node, then we
@@ -542,12 +510,12 @@ func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 			// capacity of an edge and clearing their min-htlc
 			// amount to our relaxation condition.
 			if tempDist < distance[v].dist &&
-				edgeInfo.Capacity >= amt.ToSatoshis() &&
-				amt >= outEdge.MinHTLC {
+				e.edgeInfo.Capacity >= amt.ToSatoshis() &&
+				amt >= e.outEdge.MinHTLC {
 
 				distance[v] = nodeWithDist{
 					dist: tempDist,
-					node: outEdge.Node,
+					node: v,
 				}
 				prev[v] = edgeWithPrev{
 					// We'll use the *incoming* edge here
@@ -555,10 +523,10 @@ func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 					// specified by the node this channel
 					// connects to.
 					edge: &ChannelHop{
-						ChannelEdgePolicy: outEdge,
-						Capacity:          edgeInfo.Capacity,
+						ChannelEdgePolicy: e.outEdge,
+						Capacity:          e.edgeInfo.Capacity,
 					},
-					prevNode: bestNode.PubKeyBytes,
+					prevNode: bestNode,
 				}
 
 				// Add this new node to our heap as we'd like
@@ -577,7 +545,7 @@ func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 
 	// If the target node isn't found in the prev hop map, then a path
 	// doesn't exist, so we terminate in an error.
-	if _, ok := prev[NewVertex(target)]; !ok {
+	if _, ok := prev[target]; !ok {
 		return nil, newErrf(ErrNoPathFound, "unable to find a path to "+
 			"destination")
 	}
@@ -587,14 +555,14 @@ func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 	// in the reverse direction which we'll use to properly calculate the
 	// timelock and fee values.
 	pathEdges := make([]*ChannelHop, 0, len(prev))
-	prevNode := NewVertex(target)
+	prevNode := target
 	for prevNode != sourceVertex { // TODO(roasbeef): assumes no cycles
 		// Add the current hop to the limit of path edges then walk
 		// backwards from this hop via the prev pointer for this hop
 		// within the prevHop map.
 		pathEdges = append(pathEdges, prev[prevNode].edge)
 
-		prevNode = Vertex(prev[prevNode].prevNode)
+		prevNode = prev[prevNode].prevNode
 	}
 
 	// The route is invalid if it spans more than 20 hops. The current
@@ -628,7 +596,9 @@ func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 // make our inner path finding algorithm aware of our k-shortest paths
 // algorithm, rather than attempting to use an unmodified path finding
 // algorithm in a block box manner.
-func findPaths(tx *bolt.Tx, graph *channeldb.ChannelGraph,
+//
+// TODO(nalinbhardwaj): Swap out channeldb.LightningNode and btcec.PublicKey for Vertex.
+func findPaths(graph graphSource,
 	source *channeldb.LightningNode, target *btcec.PublicKey,
 	amt lnwire.MilliSatoshi, numPaths uint32) ([][]*ChannelHop, error) {
 
@@ -646,7 +616,7 @@ func findPaths(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 	// selfNode) to the target destination that's capable of carrying amt
 	// satoshis along the path before fees are calculated.
 	startingPath, err := findPath(
-		tx, graph, source, target, ignoredVertexes, ignoredEdges, amt,
+		graph, Vertex(source.PubKeyBytes), NewVertex(target), ignoredVertexes, ignoredEdges, amt,
 	)
 	if err != nil {
 		log.Errorf("Unable to find path: %v", err)
@@ -685,7 +655,7 @@ func findPaths(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 			// Our spur node is the i-th node in the prior shortest
 			// path, and our root path will be all nodes in the
 			// path leading up to our spurNode.
-			spurNode := prevShortest[i].Node
+			spurNode := Vertex(prevShortest[i].Node.PubKeyBytes)
 			rootPath := prevShortest[:i+1]
 
 			// Before we kickoff our next path finding iteration,
@@ -706,12 +676,12 @@ func findPaths(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 			// aren't the current spur node from the graph. This
 			// ensures we don't create a path with loops.
 			for _, hop := range rootPath {
-				node := hop.Node.PubKeyBytes
-				if node == spurNode.PubKeyBytes {
+				node := Vertex(hop.Node.PubKeyBytes)
+				if bytes.Equal(node[:], spurNode[:]) {
 					continue
 				}
 
-				ignoredVertexes[Vertex(node)] = struct{}{}
+				ignoredVertexes[node] = struct{}{}
 			}
 
 			// With the edges that are part of our root path, and
@@ -719,7 +689,7 @@ func findPaths(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 			// root path removed, we'll attempt to find another
 			// shortest path from the spur node to the destination.
 			spurPath, err := findPath(
-				tx, graph, spurNode, target, ignoredVertexes,
+				graph, spurNode, NewVertex(target), ignoredVertexes,
 				ignoredEdges, amt,
 			)
 

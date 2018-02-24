@@ -1290,11 +1290,16 @@ func (r *ChannelRouter) FindRoutes(target *btcec.PublicKey,
 		return nil, err
 	}
 
+	g, err := newMemChannelGraphFromDatabase(r.cfg.Graph)
+	if err != nil {
+		return nil, err
+	}
+
 	// Now that we know the destination is reachable within the graph,
 	// we'll execute our KSP algorithm to find the k-shortest paths from
 	// our source to the destination.
 	shortestPaths, err := findPaths(
-		tx, r.cfg.Graph, r.selfNode, target, amt, numPaths,
+		g, r.selfNode, target, amt, numPaths,
 	)
 	if err != nil {
 		tx.Rollback()
@@ -1466,12 +1471,19 @@ func (r *ChannelRouter) SendPayment(payment *LightningPayment) ([32]byte, *Route
 	// We'll continue until either our payment succeeds, or we encounter a
 	// critical error during path finding.
 	for {
+
+		g, err := newMemChannelGraphFromDatabase(paySession.mc.graph)
+		if err != nil {
+			return [32]byte{}, nil, fmt.Errorf("unable to "+
+				"create MemChannelGraph: %v", err)
+		}
+
 		// We'll kick things off by requesting a new route from mission
 		// control, which will incorporate the current best known state
 		// of the channel graph and our past HTLC routing
 		// successes/failures.
 		route, err := paySession.RequestRoute(
-			payment, uint32(currentHeight), finalCLTVDelta,
+			g, payment, uint32(currentHeight), finalCLTVDelta,
 		)
 		if err != nil {
 			// If we're unable to successfully make a payment using
