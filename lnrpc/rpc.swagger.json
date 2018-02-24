@@ -320,6 +320,16 @@
             }
           }
         },
+        "parameters": [
+          {
+            "name": "diameter",
+            "description": "If diameter should be calculated or not.",
+            "in": "query",
+            "required": false,
+            "type": "boolean",
+            "format": "boolean"
+          }
+        ],
         "tags": [
           "Lightning"
         ]
@@ -1460,7 +1470,7 @@
       "properties": {
         "graph_diameter": {
           "type": "integer",
-          "format": "int64"
+          "format": "int32"
         },
         "avg_out_degree": {
           "type": "number",

@@ -1804,6 +1804,13 @@ var getNetworkInfoCommand = cli.Command{
 	Usage: "Getnetworkinfo",
 	Description: "Returns a set of statistics pertaining to the known channel " +
 		"graph",
+	Flags: []cli.Flag{
+		cli.BoolFlag{
+			Name: "diameter",
+			Usage: "If diameter of graph should be determined and returned." +
+				"Note that this is quite slow and resource intensive.",
+		},
+	},
 	Action: actionDecorator(getNetworkInfo),
 }
 
@@ -1812,7 +1819,9 @@ func getNetworkInfo(ctx *cli.Context) error {
 	client, cleanUp := getClient(ctx)
 	defer cleanUp()
 
-	req := &lnrpc.NetworkInfoRequest{}
+	req := &lnrpc.NetworkInfoRequest{
+		Diameter: ctx.Bool("diameter"),
+	}
 
 	netInfo, err := client.GetNetworkInfo(ctxb, req)
 	if err != nil {
