@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sync"
 
 	"container/heap"
 
@@ -732,4 +733,90 @@ func findPaths(graph graphSource,
 	}
 
 	return shortestPaths, nil
+}
+
+// FindDiam computes the diameter of the known graph using breadth first search
+// in O(N*(N+M)) time, where N = number of known nodes in graph, and M = number of
+// known channels. Graph Diameter = maximum length of shortest path in graph
+// between two nodes.
+//
+// TODO(nalinbhardwaj): Use faster average-time algorithm? Or an approximate algorithm.
+func (r *ChannelRouter) FindDiam() (uint32, error) {
+	// Before attempting to perform a series of graph traversals to find
+	// the diameter of the graph, we'll first consult our diameter cache
+	r.graphInfoCacheMtx.RLock()
+	diam := r.diamCache
+	r.graphInfoCacheMtx.RUnlock()
+
+	// If we already have cached diameter, then we'll return it directly as
+	// there's no need to repeat the computation.
+	if diam != -1 {
+		return uint32(diam), nil
+	}
+
+	// Mutex to use to prevent data races
+	var diamMutex = &sync.Mutex{}
+
+	graph, err := newMemChannelGraphFromDatabase(r.cfg.Graph)
+	if err != nil {
+		return 0, err
+	}
+
+	// We'll run through all the nodes in graph, find farthest node from
+	// each, and take the maximum of that distance.
+	if err := graph.AsyncForEachNode(func(sourceNode Vertex, nodeerr chan error) {
+
+		// This will store the farthest node distance.
+		maxDist := 0
+		queue := []Vertex{sourceNode}
+		distance := make(map[Vertex]int)
+		distance[sourceNode] = 0
+
+		for len(queue) > 0 {
+			top := queue[0]
+			queue = queue[1:]
+
+			// Run through all channels to find neighbours.
+			if err := graph.ForEachChannel(top, func(e *Edge) error {
+
+				// Get a neighbour.
+				neighbour := Vertex(e.outEdge.Node.PubKeyBytes)
+
+				if _, ok := distance[neighbour]; !ok {
+					// Put this node in distance (so we don't process it again).
+					distance[neighbour] = distance[top] + 1
+
+					// This has to be the farthest node visited yet, so update maxDist.
+					maxDist = distance[neighbour]
+
+					queue = append(queue, neighbour)
+				}
+
+				return nil
+			}); err != nil {
+				nodeerr <- err
+			}
+		}
+
+		// Update diam using maxDist if necessary.
+		diamMutex.Lock()
+		if maxDist > diam {
+			diam = maxDist
+		}
+		diamMutex.Unlock()
+
+		nodeerr <- nil
+	}); err != nil {
+		return 0, err
+	}
+
+	// Populate the cache with this fresh diameter so we can
+	// reuse it in the future.
+	r.graphInfoCacheMtx.RLock()
+	diamMutex.Lock()
+	r.diamCache = diam
+	diamMutex.Unlock()
+	r.graphInfoCacheMtx.RUnlock()
+
+	return uint32(diam), nil
 }
