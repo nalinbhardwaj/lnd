@@ -11,12 +11,13 @@ import (
 	"math/big"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/golang/protobuf/jsonpb"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/roasbeef/btcd/btcec"
 	"github.com/roasbeef/btcd/chaincfg/chainhash"
@@ -137,12 +138,11 @@ func parseDescribeGraph(path string, sourceNodeAlias string) (
 		return nil, nil, nil, err
 	}
 
-	var topObj map[string]interface{}
-	if err := json.Unmarshal(graphJSON, &topObj); err != nil {
+	topObj := &lnrpc.ChannelGraph{}
+
+	if err := jsonpb.UnmarshalString(graphJSON, &topObj); err != nil {
 		panic(err)
 	}
-
-	nodes := topObj["nodes"].([]interface{})
 
 	// We'll use this fake address for the IP address of all the nodes in
 	// our tests. This value isn't needed for path finding so it doesn't
@@ -164,9 +164,8 @@ func parseDescribeGraph(path string, sourceNodeAlias string) (
 	var source *channeldb.LightningNode
 
 	// First we insert all the nodes within the graph as vertexes.
-	for _, n := range nodes {
-		node := n.(map[string]interface{})
-		pubKey := node["pub_key"].(string)
+	for _, node := range topObj.Nodes {
+		pubKey := node.PubKey
 		pubBytes, err := hex.DecodeString(pubKey)
 		if err != nil {
 			return nil, nil, nil, err
@@ -219,10 +218,8 @@ func parseDescribeGraph(path string, sourceNodeAlias string) (
 
 	// With all the vertexes inserted, we can now insert the edges into the
 	// test graph.
-	edges := topObj["edges"].([]interface{})
-	for _, e := range edges {
-		edge := e.(map[string]interface{})
-		node1Bytes, err := hex.DecodeString(edge["node1_pub"].(string))
+	for _, edge := range topObj.Edges {
+		node1Bytes, err := hex.DecodeString(edge.Node1Pub)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -231,7 +228,7 @@ func parseDescribeGraph(path string, sourceNodeAlias string) (
 			return nil, nil, nil, err
 		}
 
-		node2Bytes, err := hex.DecodeString(edge["node2_pub"].(string))
+		node2Bytes, err := hex.DecodeString(edge.Node2Pub)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -240,7 +237,7 @@ func parseDescribeGraph(path string, sourceNodeAlias string) (
 			return nil, nil, nil, err
 		}
 
-		fundingTXID := strings.Split(edge["chan_point"].(string), ":")[0]
+		fundingTXID := strings.Split(edge.ChanPoint, ":")[0]
 		txidBytes, err := chainhash.NewHashFromStr(fundingTXID)
 		if err != nil {
 			return nil, nil, nil, err
@@ -250,51 +247,15 @@ func parseDescribeGraph(path string, sourceNodeAlias string) (
 			Index: 0,
 		}
 
-		// We first insert the existence of the edge between the two
-		// nodes.
-		chanID, err := strconv.ParseUint(edge["channel_id"].(string), 10, 64)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		cap, err := strconv.ParseUint(edge["capacity"].(string), 10, 64)
-		if err != nil {
-			return nil, nil, nil, err
-		}
 		edgeInfo := channeldb.ChannelEdgeInfo{
-			ChannelID:    chanID,
+			ChannelID:    edge.ChannelId,
 			AuthProof:    &testAuthProof,
 			ChannelPoint: fundingPoint,
-			Capacity:     btcutil.Amount(cap),
+			Capacity:     btcutil.Amount(edge.Capacity),
 		}
 		edgeInfo.AddNodeKeys(node1Pub, node2Pub, node1Pub, node2Pub)
 		if err := graph.AddChannelEdge(&edgeInfo); err != nil {
 			return nil, nil, nil, err
-		}
-
-		parseEdgePolicy := func(edgePolicy map[string]interface{}) (
-			*channeldb.ChannelEdgePolicy, error) {
-
-			minHtlc, err := strconv.ParseUint(edgePolicy["min_htlc"].(string), 10, 64)
-			if err != nil {
-				return nil, err
-			}
-			feeBase, err := strconv.ParseUint(edgePolicy["fee_base_msat"].(string), 10, 64)
-			if err != nil {
-				return nil, err
-			}
-			feeRate, err := strconv.ParseUint(edgePolicy["fee_rate_milli_msat"].(string), 10, 64)
-			if err != nil {
-				return nil, err
-			}
-			return &channeldb.ChannelEdgePolicy{
-				SigBytes:                  testSig.Serialize(),
-				ChannelID:                 chanID,
-				LastUpdate:                time.Unix(int64(edge["last_update"].(float64)), 0),
-				TimeLockDelta:             uint16(edgePolicy["time_lock_delta"].(float64)),
-				MinHTLC:                   lnwire.MilliSatoshi(minHtlc),
-				FeeBaseMSat:               lnwire.MilliSatoshi(feeBase),
-				FeeProportionalMillionths: lnwire.MilliSatoshi(feeRate),
-			}, nil
 		}
 
 		// As the graph itself is directed, we need to insert two edges
@@ -302,29 +263,35 @@ func parseDescribeGraph(path string, sourceNodeAlias string) (
 		// node2->node1. A flag of 0 indicates this is the routing
 		// policy for the first node, and a flag of 1 indicates its the
 		// information for the second node.
-		node1Policy, ok := edge["node1_policy"].(map[string]interface{})
-		if ok {
-			edge1Policy, err := parseEdgePolicy(node1Policy)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			edge1Policy.Flags = 0
-			if err := graph.UpdateEdgePolicy(edge1Policy); err != nil {
-				return nil, nil, nil, err
-			}
-
+		c1Policy := edge.Node1Policy
+		
+		node1Policy := &channeldb.ChannelEdgePolicy{
+				SigBytes:                  testSig.Serialize(),
+				ChannelID:                 edge.ChannelId,
+				LastUpdate:                time.Unix(int64(edge.LastUpdate), 0),
+				TimeLockDelta:             uint16(c1Policy.TimeLockDelta),
+				MinHTLC:                   lnwire.MilliSatoshi(c1Policy.MinHtlc),
+				FeeBaseMSat:               lnwire.MilliSatoshi(c1Policy.FeeBaseMsat),
+				FeeProportionalMillionths: lnwire.MilliSatoshi(c1Policy.FeeRateMilliMsat),
+		}
+		node1Policy.Flags = 0
+		if err := graph.UpdateEdgePolicy(node1Policy); err != nil {
+			return nil, nil, nil, err
 		}
 
-		node2Policy, ok := edge["node2_policy"].(map[string]interface{})
-		if ok {
-			edge2Policy, err := parseEdgePolicy(node2Policy)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			edge2Policy.Flags = 1
-			if err := graph.UpdateEdgePolicy(edge2Policy); err != nil {
-				return nil, nil, nil, err
-			}
+		c2Policy := edge.Node2Policy
+		node2Policy := &channeldb.ChannelEdgePolicy{
+				SigBytes:                  testSig.Serialize(),
+				ChannelID:                 edge.ChannelId,
+				LastUpdate:                time.Unix(int64(edge.LastUpdate), 0),
+				TimeLockDelta:             uint16(c2Policy.TimeLockDelta),
+				MinHTLC:                   lnwire.MilliSatoshi(c2Policy.MinHtlc),
+				FeeBaseMSat:               lnwire.MilliSatoshi(c2Policy.FeeBaseMsat),
+				FeeProportionalMillionths: lnwire.MilliSatoshi(c2Policy.FeeRateMilliMsat),
+		}
+		node2Policy.Flags = 1
+		if err := graph.UpdateEdgePolicy(node2Policy); err != nil {
+			return nil, nil, nil, err
 		}
 	}
 
