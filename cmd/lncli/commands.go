@@ -1778,8 +1778,8 @@ func drawChannelGraph(graph *lnrpc.ChannelGraph) error {
 	// Once our dot file has been written to disk, we can use the dot
 	// command itself to generate the drawn rendering of the graph
 	// described.
-	drawCmd := exec.Command("dot", "-T"+"svg", "-o"+imageFile.Name(),
-		tempDotFile.Name())
+	drawCmd := exec.Command("dot", "-T"+"svg", "-Ln"+"1000",
+		"-o"+imageFile.Name(), tempDotFile.Name())
 	drawCmd.Stderr = &errBuffer
 	if err := drawCmd.Run(); err != nil {
 		fmt.Println("error rendering graph: ", errBuffer.String())
