@@ -14,7 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/protobuf/jsonpb"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/roasbeef/btcd/btcec"
 	"github.com/roasbeef/btcd/chaincfg/chainhash"
@@ -40,6 +42,11 @@ const (
 	// implementations will use in order to ensure that they're calculating
 	// the payload for each hop in path properly.
 	specExampleFilePath = "testdata/spec_example.json"
+
+	// testNetGraphFilePath is file storing the JSON dump from
+	// 'lncli describegraph' on 2017-10-13. This is used for benchmarking
+	// findPaths scenario on a graph with nodes having high in-degree.
+	testNetGraphFilePath = "testdata/testnet.json"
 )
 
 var (
@@ -117,6 +124,178 @@ func makeTestGraph() (*channeldb.ChannelGraph, func(), error) {
 	}
 
 	return cdb.ChannelGraph(), cleanUp, nil
+}
+
+// parseDescribeGraph parses a JSON file created by using 'lncli describegraph',
+// and populates a ChannelGraph with this graph info.
+func parseDescribeGraph(path string, sourceNodeAlias string) (
+	*channeldb.ChannelGraph, func(), aliasMap, error) {
+	graphJSON, err := os.Open(path)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	topObj := lnrpc.ChannelGraph{}
+
+	if err := jsonpb.Unmarshal(graphJSON, &topObj); err != nil {
+		return nil, nil, nil, err
+	}
+
+	// We'll use this fake address for the IP address of all the nodes in
+	// our tests. This value isn't needed for path finding so it doesn't
+	// need to be unique.
+	var testAddrs []net.Addr
+	testAddr, err := net.ResolveTCPAddr("tcp", "192.0.0.1:8888")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	testAddrs = append(testAddrs, testAddr)
+
+	// Next, create a temporary graph database for usage within the test.
+	graph, cleanUp, err := makeTestGraph()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	aliasMap := make(map[string]*btcec.PublicKey)
+	var source *channeldb.LightningNode
+
+	// First we insert all the nodes within the graph as vertexes.
+	for _, node := range topObj.Nodes {
+		pubKey := node.PubKey
+		pubBytes, err := hex.DecodeString(pubKey)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		pub, err := btcec.ParsePubKey(pubBytes, btcec.S256())
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		alias := hex.EncodeToString(pubBytes[:10])
+		dbNode := &channeldb.LightningNode{
+			HaveNodeAnnouncement: true,
+			AuthSigBytes:         testSig.Serialize(),
+			LastUpdate:           time.Now(),
+			Addresses:            testAddrs,
+			Alias:                alias,
+			Features:             testFeatures,
+		}
+		copy(dbNode.PubKeyBytes[:], pub.SerializeCompressed())
+
+		// We require all aliases within the graph to be unique for our
+		// tests.
+		if _, ok := aliasMap[alias]; ok {
+			return nil, nil, nil, errors.New("aliases for nodes " +
+				"must be unique! " + alias)
+		}
+
+		// If the alias is unique, then add the node to the
+		// alias map for easy lookup.
+		aliasMap[alias] = pub
+
+		// If this node's alias is set as the source's alias,
+		// then we create a pointer to is so we can mark the
+		// source in the graph properly.
+		if alias == sourceNodeAlias {
+			source = dbNode
+		}
+
+		// With the node fully parsed, add it as a vertex within the
+		// graph.
+		if err := graph.AddLightningNode(dbNode); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	// Set the selected source node
+	if err := graph.SetSourceNode(source); err != nil {
+		return nil, nil, nil, err
+	}
+
+	// With all the vertexes inserted, we can now insert the edges into the
+	// test graph.
+	for _, edge := range topObj.Edges {
+		node1Bytes, err := hex.DecodeString(edge.Node1Pub)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		node1Pub, err := btcec.ParsePubKey(node1Bytes, btcec.S256())
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		node2Bytes, err := hex.DecodeString(edge.Node2Pub)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		node2Pub, err := btcec.ParsePubKey(node2Bytes, btcec.S256())
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		fundingTXID := strings.Split(edge.ChanPoint, ":")[0]
+		txidBytes, err := chainhash.NewHashFromStr(fundingTXID)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		fundingPoint := wire.OutPoint{
+			Hash:  *txidBytes,
+			Index: 0,
+		}
+
+		edgeInfo := channeldb.ChannelEdgeInfo{
+			ChannelID:    edge.ChannelId,
+			AuthProof:    &testAuthProof,
+			ChannelPoint: fundingPoint,
+			Capacity:     btcutil.Amount(edge.Capacity),
+		}
+		edgeInfo.AddNodeKeys(node1Pub, node2Pub, node1Pub, node2Pub)
+		if err := graph.AddChannelEdge(&edgeInfo); err != nil {
+			return nil, nil, nil, err
+		}
+
+		// As the graph itself is directed, we need to insert two edges
+		// into the graph: one from node1->node2 and one from
+		// node2->node1. A flag of 0 indicates this is the routing
+		// policy for the first node, and a flag of 1 indicates its the
+		// information for the second node.
+		c1Policy := edge.Node1Policy
+		if c1Policy != nil {
+			node1Policy := &channeldb.ChannelEdgePolicy{
+				SigBytes:                  testSig.Serialize(),
+				ChannelID:                 edge.ChannelId,
+				LastUpdate:                time.Unix(int64(edge.LastUpdate), 0),
+				TimeLockDelta:             uint16(c1Policy.TimeLockDelta),
+				MinHTLC:                   lnwire.MilliSatoshi(c1Policy.MinHtlc),
+				FeeBaseMSat:               lnwire.MilliSatoshi(c1Policy.FeeBaseMsat),
+				FeeProportionalMillionths: lnwire.MilliSatoshi(c1Policy.FeeRateMilliMsat),
+			}
+			node1Policy.Flags = 0
+			if err := graph.UpdateEdgePolicy(node1Policy); err != nil {
+				return nil, nil, nil, err
+			}
+		}
+
+		c2Policy := edge.Node2Policy
+		if c2Policy != nil {
+			node2Policy := &channeldb.ChannelEdgePolicy{
+				SigBytes:                  testSig.Serialize(),
+				ChannelID:                 edge.ChannelId,
+				LastUpdate:                time.Unix(int64(edge.LastUpdate), 0),
+				TimeLockDelta:             uint16(c2Policy.TimeLockDelta),
+				MinHTLC:                   lnwire.MilliSatoshi(c2Policy.MinHtlc),
+				FeeBaseMSat:               lnwire.MilliSatoshi(c2Policy.FeeBaseMsat),
+				FeeProportionalMillionths: lnwire.MilliSatoshi(c2Policy.FeeRateMilliMsat),
+			}
+			node2Policy.Flags = 1
+			if err := graph.UpdateEdgePolicy(node2Policy); err != nil {
+				return nil, nil, nil, err
+			}
+		}
+	}
+
+	return graph, cleanUp, aliasMap, nil
 }
 
 // aliasMap is a map from a node's alias to its public key. This type is

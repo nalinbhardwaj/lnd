@@ -1914,7 +1914,7 @@ func TestBenchmarkSendPayment(t *testing.T) {
 	ctx.router.cfg.SendToSwitch = func(n [33]byte,
 		_ *lnwire.UpdateAddHTLC, _ *sphinx.Circuit) ([32]byte, error) {
 
-		if int(n[32])%3 == 0 {
+		if int(n[32])%5 == 0 {
 			pub, err := sourceNode.PubKey()
 			if err != nil {
 				return preImage, err
