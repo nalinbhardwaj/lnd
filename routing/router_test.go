@@ -1601,6 +1601,7 @@ func TestFindPathFeeWeighting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to fetch source node: %v", err)
 	}
+	sourceVertex := Vertex(sourceNode.PubKeyBytes)
 
 	ignoreVertex := make(map[Vertex]struct{})
 	ignoreEdge := make(map[uint64]struct{})
@@ -1611,12 +1612,18 @@ func TestFindPathFeeWeighting(t *testing.T) {
 	if target == nil {
 		t.Fatalf("unable to find target node")
 	}
+	targetVertex := NewVertex(target)
+
+	g, err := newMemChannelGraphFromDatabase(ctx.graph)
+	if err != nil {
+		t.Fatalf("unable to create MemChannelGraph: %v", err)
+	}
 
 	// We'll now attempt a path finding attempt using this set up. Due to
 	// the edge weighting, we should select the direct path over the 2 hop
 	// path even though the direct path has a higher potential time lock.
 	path, err := findPath(
-		nil, ctx.graph, nil, sourceNode, target, ignoreVertex,
+		g, nil, sourceVertex, targetVertex, ignoreVertex,
 		ignoreEdge, amt,
 	)
 	if err != nil {
